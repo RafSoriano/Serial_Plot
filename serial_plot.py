@@ -12,27 +12,31 @@ Example of acceptable formats:
 import time
 import threading
 import serial
+from serial import Serial
 from serial.tools import list_ports
 import matplotlib.pyplot as plt
+from matplotlib.widgets import TextBox
 from matplotlib.ticker import AutoMinorLocator, MaxNLocator
 import numpy as np
 from timed_queue import TimedQueue
 stop_event = threading.Event()
 
 def main(opts):
-    ser = open_serial_port(opts.port, opts.baud)
+    ser: Serial = open_serial_port(opts.port, opts.baud)
     
     series = {}
 
     # Start the background reader thread (module-level reader_loop)
     rl = threading.Thread(target=reader_loop, args=(ser, series, opts.x_range), daemon=True)
     rl.start()
-
     try:
-        plot_loop(series , opts)
+        plot_loop(series, opts, ser, opts.line_ending)
     except KeyboardInterrupt:
+        pass
+    finally:
         stop_event.set()
-        rl.join(timeout=10)
+        ser.close()
+        rl.join(timeout=1)
 
 
 def open_serial_port(port, rate):
@@ -49,7 +53,7 @@ def open_serial_port(port, rate):
 
         for c in candidates:
             try:
-                ser = serial.Serial(c, rate, timeout=None)
+                ser = serial.Serial(c, rate, timeout=0.1, write_timeout=1)
                 print(f"Opened serial port {c} @ {rate}")
                 return ser
             except Exception as e:
@@ -93,48 +97,86 @@ def downsample_for_display(timestamps, values, now, x_range, pixel_width):
     return np.repeat(bucket_x, 2), bucket_y
 
 
-def parse_line(line):
-    samples = []
+def read_and_parse(ser: Serial) -> list[tuple[str, float]]:
+    raw_line: bytes = ser.readline()
+    if not raw_line:
+        return []
+    line: str = raw_line.decode('utf-8', errors='replace')
+    samples : list[tuple[str, float]] = []
+
     for index, item in enumerate(line.split(',')):
-        parts = item.split(':', maxsplit=1)
-        if len(parts) == 2:
-            label, raw_value = parts[0].strip(), parts[1].strip()
-            if not label:
-                print(f"Skipping unparseable field: {item}")
-                continue
+        item = item.strip()
+        if ':' in item:
+            label, value = item.split(':', maxsplit=1)
         else:
             label = chr(ord('A') + index)
-            raw_value = item.strip()
+            value = item
 
+        label = label.strip()
+        value = value.strip()
         try:
-            samples.append((label, float(raw_value)))
+            value = float(value)
         except ValueError:
-            print(f"Skipping unparseable value: {raw_value}")
+            print(f'Unparsed: {line.strip()}')
+
+            return []  # If any value is not a float, return empty to indicate parse failure
+        samples.append((label, value))
     return samples
-
-
-def read_and_parse(ser):
-    while True:
-        line = ser.readline().decode('utf-8').strip()
-        samples = parse_line(line)
-        if samples:
-            return samples
-        print(f"Skipping unparseable line: {line}")
 
 def reader_loop(ser, series, x_range):
     """Background reader: read lines from serial and add to per-label TimedQueue.
     """
     while not stop_event.is_set():
-        for label, value in read_and_parse(ser):
+        try:
+            samples = read_and_parse(ser)
+        except serial.SerialException:
+            if stop_event.is_set():
+                return # Don't print error if we're shutting down. This is expected
+            raise
+        for label, value in samples:
             if label not in series:
                 # create storage for label; plotting line will be created by main thread
                 series[label] = {}
                 series[label]['data'] = TimedQueue(timeout_seconds=x_range + .01)
             series[label]['data'].add(value)
 
-def plot_loop(series , opts):
+def encode_message(message, line_ending):
+    message = message.strip()
+    if message.startswith("0x"):
+        msg = message.removeprefix("0x")
+        try:
+            return bytes.fromhex(msg) + line_ending.encode('utf-8')
+        except:
+            pass # If the message isn't valid hex, fall back to normal encoding
+    return (message + line_ending).encode('utf-8')
+
+def plot_loop(series, opts, ser, line_ending):
     plt.ion()  # Turn on interactive mode
     fig, ax = plt.subplots()
+    fig.subplots_adjust(bottom=0.22)
+    message_box = TextBox(fig.add_axes((0.12, 0.08, 0.76, 0.06)), 'Send:')
+    send_status = fig.text(0.12, 0.045, '', fontsize=9)
+
+    def submit_message(message):
+        try:
+            msg_bytes = encode_message(message, line_ending)
+            ser.write(msg_bytes)
+        except (serial.SerialException, ValueError) as error:
+            send_status.set_text(f"Send failed: {error}")
+            send_status.set_color('red')
+        else:
+            send_status.set_text('Sent')
+            send_status.set_color('green')
+            message_box.eventson = False
+            try:
+                message_box.set_val('')
+            finally:
+                message_box.eventson = True
+        fig.canvas.draw_idle()
+
+    message_box.on_submit(submit_message)
+    fig.canvas.mpl_connect('close_event', lambda _event: stop_event.set())
+
     copy_from_bbox = getattr(fig.canvas, 'copy_from_bbox', None)
     restore_region = getattr(fig.canvas, 'restore_region', None)
     use_blit = (
@@ -242,6 +284,7 @@ if __name__ == '__main__':
     parser.add_argument('--baud', type=int, default=115200, help='Serial baud rate')
     parser.add_argument('--x-range', type=int, default=10, help='X axis window in seconds')
     parser.add_argument('--update-interval', type=float, default=0.1, help='Plot update interval in seconds')
+    parser.add_argument('--line-ending', default='\r\n',help='string appended to each sent message (default: \r\n )',)
     parser.add_argument('--y_min', type=float, help='min Y axis value')
     parser.add_argument('--y_max', type=float, help='min Y axis value')
     parser.add_argument('--y_label', type=str, help='Y-axis label')
