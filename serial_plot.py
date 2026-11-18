@@ -7,7 +7,6 @@ Example of acceptable formats:
 2. valueA, valueB \n
 3 labelA: valueA \n labelB: valueB \n  **
 **This format will result in a slightly later timestamp for valueB vs valueA.
-xesuedele
 """
 
 import time
